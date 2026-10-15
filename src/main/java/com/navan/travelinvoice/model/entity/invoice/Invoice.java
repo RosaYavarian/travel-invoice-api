@@ -43,6 +43,16 @@ public class Invoice {
         lines.add(line);
     }
 
+    public void clearLines() {
+        lines.forEach(line -> line.setInvoice(null));
+        lines.clear();
+    }
+
+    public void updateTotals(String currency, BigDecimal grandTotal) {
+        this.currency = currency;
+        this.grandTotal = grandTotal;
+    }
+
     public Long getId() { return id; }
     public String getCurrency() { return currency; }
     public BigDecimal getGrandTotal() { return grandTotal; }

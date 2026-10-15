@@ -20,6 +20,7 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
+import java.util.TreeSet;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -36,12 +37,51 @@ public class InvoiceService {
 
     @Transactional
     public InvoiceResponse create(CreateInvoiceRequest request) {
-        List<Long> ids = request.sortedTransactionIds();
+        InvoiceContents contents = copySources(lockTransactions(request.sortedTransactionIds()));
+        Invoice invoice = new Invoice(contents.currency(), contents.grandTotal());
+        contents.lines().forEach(invoice::addLine);
+        return response(invoices.saveAndFlush(invoice));
+    }
+
+    @Transactional
+    public InvoiceResponse patch(long id, CreateInvoiceRequest request) {
+        Invoice invoice = lockInvoice(id);
+        List<Long> requestedIds = request.sortedTransactionIds();
+        TreeSet<Long> union = new TreeSet<>(requestedIds);
+        invoice.getLines().forEach(line -> union.add(line.getTransactionId()));
+        Map<Long, Transaction> locked = new TreeMap<>();
+        lockTransactions(new ArrayList<>(union)).forEach(source -> locked.put(source.getId(), source));
+        InvoiceContents contents = copySources(requestedIds.stream().map(locked::get).toList());
+        invoice.clearLines();
+        invoices.flush();
+        invoice.updateTotals(contents.currency(), contents.grandTotal());
+        contents.lines().forEach(invoice::addLine);
+        return response(invoices.saveAndFlush(invoice));
+    }
+
+    @Transactional
+    public void delete(long id) {
+        Invoice invoice = lockInvoice(id);
+        List<Long> ids = invoice.getLines().stream().map(InvoiceLineSnapshot::getTransactionId).sorted().toList();
+        lockTransactions(ids);
+        invoices.delete(invoice);
+        invoices.flush();
+    }
+
+    private Invoice lockInvoice(long id) {
+        return invoices.findByIdForUpdate(id).orElseThrow(() -> new InvoiceNotFoundException(id));
+    }
+
+    private List<Transaction> lockTransactions(List<Long> sortedIds) {
         List<Transaction> sources = new ArrayList<>();
-        for (Long id : ids) {
+        for (Long id : sortedIds) {
             sources.add(transactions.findByIdForUpdate(id)
                     .orElseThrow(() -> new TransactionNotFoundException(id)));
         }
+        return sources;
+    }
+
+    private InvoiceContents copySources(List<Transaction> sources) {
         String currency = sources.getFirst().getCurrency();
         if (sources.stream().anyMatch(source -> !currency.equals(source.getCurrency()))) {
             throw new InvoiceConflictException("All invoice transactions must have the same currency");
@@ -51,21 +91,24 @@ public class InvoiceService {
         if (grandTotal.abs().compareTo(MAX_TOTAL) > 0) {
             throw new InvalidInvoiceException("Invoice grand_total exceeds the supported monetary precision");
         }
-        Invoice invoice = new Invoice(currency, grandTotal);
+        List<InvoiceLineSnapshot> lines = new ArrayList<>();
         for (Transaction source : sources) {
             List<TaxLine> taxes = source.getTaxLines().stream()
                     .map(tax -> new TaxLine(tax.getName(), tax.getRate(), tax.getAmount())).toList();
             List<FeeLine> fees = source.getFeeLines().stream()
                     .map(fee -> new FeeLine(fee.getName(), fee.getAmount())).toList();
-            invoice.addLine(new InvoiceLineSnapshot(source.getId(), source.getType(), source.getCurrency(),
+            lines.add(new InvoiceLineSnapshot(source.getId(), source.getType(), source.getCurrency(),
                     source.getTotal(), source.getMetadata(), taxes, fees));
         }
-        return response(invoices.saveAndFlush(invoice));
+        return new InvoiceContents(currency, grandTotal, lines);
+    }
+
+    private record InvoiceContents(String currency, BigDecimal grandTotal, List<InvoiceLineSnapshot> lines) {
     }
 
     @Transactional(readOnly = true)
     public InvoiceResponse get(long id) {
-        return response(invoices.findById(id).orElseThrow(() -> new InvoiceNotFoundException(id)));
+        return response(invoices.findWithLinesById(id).orElseThrow(() -> new InvoiceNotFoundException(id)));
     }
 
     private InvoiceResponse response(Invoice invoice) {

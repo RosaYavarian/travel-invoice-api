@@ -6,6 +6,8 @@ import com.navan.travelinvoice.service.invoice.InvoiceService;
 import java.net.URI;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PatchMapping;
+import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
@@ -30,5 +32,16 @@ public class InvoiceController {
     @GetMapping("/{id}")
     public InvoiceResponse get(@PathVariable long id) {
         return service.get(id);
+    }
+
+    @PatchMapping("/{id}")
+    public InvoiceResponse patch(@PathVariable long id, @RequestBody CreateInvoiceRequest request) {
+        return service.patch(id, request);
+    }
+
+    @DeleteMapping("/{id}")
+    public ResponseEntity<Void> delete(@PathVariable long id) {
+        service.delete(id);
+        return ResponseEntity.noContent().build();
     }
 }
