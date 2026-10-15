@@ -1,4 +1,4 @@
-package com.navan.travelinvoice.exception;
+package com.navan.travelinvoice.exception.transaction;
 
 public class DuplicateTransactionException extends RuntimeException {
     private final Long existingId;

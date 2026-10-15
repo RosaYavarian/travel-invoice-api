@@ -1,6 +1,13 @@
 package com.navan.travelinvoice.exception;
 
 import java.util.Map;
+
+import com.navan.travelinvoice.exception.invoice.InvalidInvoiceException;
+import com.navan.travelinvoice.exception.invoice.InvoiceConflictException;
+import com.navan.travelinvoice.exception.invoice.InvoiceNotFoundException;
+import com.navan.travelinvoice.exception.transaction.DuplicateTransactionException;
+import com.navan.travelinvoice.exception.transaction.InvalidTransactionException;
+import com.navan.travelinvoice.exception.transaction.TransactionNotFoundException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ProblemDetail;
 import org.springframework.http.ResponseEntity;
@@ -12,6 +19,21 @@ import org.springframework.web.method.annotation.MethodArgumentTypeMismatchExcep
 
 @RestControllerAdvice
 public class ApiExceptionHandler {
+    @ExceptionHandler(InvoiceConflictException.class)
+    public ProblemDetail invoiceConflict(InvoiceConflictException exception) {
+        return ProblemDetail.forStatusAndDetail(HttpStatus.CONFLICT, exception.getMessage());
+    }
+
+    @ExceptionHandler(InvoiceNotFoundException.class)
+    public ProblemDetail invoiceNotFound(InvoiceNotFoundException exception) {
+        return ProblemDetail.forStatusAndDetail(HttpStatus.NOT_FOUND, exception.getMessage());
+    }
+
+    @ExceptionHandler(InvalidInvoiceException.class)
+    public ProblemDetail invalidInvoice(InvalidInvoiceException exception) {
+        return ProblemDetail.forStatusAndDetail(HttpStatus.BAD_REQUEST, exception.getMessage());
+    }
+
     @ExceptionHandler(DuplicateTransactionException.class)
     public ResponseEntity<ProblemDetail> duplicate(DuplicateTransactionException exception) {
         ProblemDetail problem = ProblemDetail.forStatusAndDetail(HttpStatus.CONFLICT, exception.getMessage());

@@ -1,4 +1,4 @@
-package com.navan.travelinvoice.exception;
+package com.navan.travelinvoice.exception.transaction;
 
 public class TransactionNotFoundException extends RuntimeException {
     public TransactionNotFoundException(long id) {

@@ -55,7 +55,7 @@ public abstract class PostgresIntegrationTestSupport {
 
     @BeforeEach
     void reset() throws Exception {
-        jdbc.execute("TRUNCATE TABLE transactions RESTART IDENTITY CASCADE");
+        jdbc.execute("TRUNCATE TABLE invoices, transactions RESTART IDENTITY CASCADE");
         seeds = mapper.readTree(Files.readString(Path.of("fixtures/task-b/seed-payloads.json")));
     }
 
@@ -100,7 +100,11 @@ public abstract class PostgresIntegrationTestSupport {
     }
 
     protected HttpResponse<String> post(JsonNode input) throws Exception {
-        return client.send(HttpRequest.newBuilder(uri("/transactions"))
+        return post("/transactions", input);
+    }
+
+    protected HttpResponse<String> post(String path, JsonNode input) throws Exception {
+        return client.send(HttpRequest.newBuilder(uri(path))
                 .timeout(Duration.ofSeconds(20))
                 .header("Content-Type", "application/json")
                 .POST(HttpRequest.BodyPublishers.ofString(mapper.writeValueAsString(input))).build(),
@@ -108,7 +112,11 @@ public abstract class PostgresIntegrationTestSupport {
     }
 
     protected HttpResponse<String> get(long id) throws Exception {
-        return client.send(HttpRequest.newBuilder(uri("/transactions/" + id)).timeout(Duration.ofSeconds(20)).GET().build(),
+        return get("/transactions/" + id);
+    }
+
+    protected HttpResponse<String> get(String path) throws Exception {
+        return client.send(HttpRequest.newBuilder(uri(path)).timeout(Duration.ofSeconds(20)).GET().build(),
                 HttpResponse.BodyHandlers.ofString());
     }
 

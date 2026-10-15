@@ -70,3 +70,23 @@ The tests confirm that two overlapping requests with the same `external_id` resu
 - No modification of the original transaction data.
 
 At the time of verification, 50 concurrent race-test executions passed without failures. This provides evidence of correctness under the tested conditions but does not guarantee that every possible concurrency schedule has been exercised.
+
+### Invoice Create and GET
+
+An invoice owns ordered snapshot lines in `invoice_line_snapshots`. Each line copies source transaction ID, type, currency, gross total, metadata, tax lines, and fee lines. The source ID is a scalar JPA field; PostgreSQL retains its existing foreign key, but invoice reads have no entity relationship to current transactions. Metadata is recursively deep-copied, tax/fee lists and their immutable value records are copied, and metadata getters return defensive copies. The existing Hibernate JSON configuration handles all snapshot JSONB fields with decimal precision preserved.
+
+Create accepts exactly one of `transaction_id` or `transaction_ids`. Empty/null/nonpositive IDs and invalid request shapes return 400; repeated IDs return 409. All sources must exist (404) and share one currency (409). Validation, source loading, snapshot copying, and invoice/header persistence happen within one database transaction. Any failure rolls back the header and every snapshot line. An aggregate outside NUMERIC(19,2) bounds is rejected with 400 before persistence.
+
+Grand total sums source gross totals once, using BigDecimal; tax and fee amounts are not added again. Tax rollups group exact, case-sensitive names and numerically equivalent rates (trailing zeros ignored), keeping an absent rate distinct from zero. Fee rollups group exact names. Rollups sort alphabetically by name, then rate with absent rate first. They are derived exclusively from persisted snapshot values, including on GET. Snapshot lines sort by database line ID; creation inserts them in ascending source ID order. No live transaction joins or new lifecycle statuses are used.
+
+### Lock Ordering for Invoice and Future Mutation Operations
+
+Invoice creation sorts unique source IDs and acquires `PESSIMISTIC_WRITE` locks individually in ascending order through `TransactionRepository.findByIdForUpdate`. All header locks are acquired before loading tax/fee collections, and remain held until invoice commit or rollback. One query per source makes lock acquisition order explicit; it favors simplicity over bulk-query throughput.
+
+Future transaction PATCH/DELETE must acquire the same parent transaction lock before checking invoice membership and before changing the header or any tax/fee children. An invoiced transaction must reject those operations with 409. Direct SQL writes to children that bypass this parent-lock protocol are outside that coordination contract.
+
+Future invoice PATCH must first lock the invoice header, then lock the union of existing and replacement transaction IDs in ascending order, and atomically rebuild its snapshots. If invoice DELETE locks source rows to coordinate membership removal, it must follow the same invoice-first, ascending-source order. Never acquire an existing invoice lock after holding source transaction locks. If a future operation locks multiple invoices, acquire those invoice locks in ascending ID order first. Invoice create has no pre-existing invoice to lock. This common ordering prevents lock cycles among compliant application operations; long-held locks and unrelated SQL can still cause waits or database timeouts.
+
+### Invoice Verification
+
+Sequential PostgreSQL 17 Testcontainers HTTP tests verify single/trip invoices (EUR 685.70), rollup grouping and decimal sums, error statuses and empty rollback results, full source header/metadata/tax/fee mutation independence, a forced failure after an earlier snapshot line was inserted, and reversed-order concurrent invoice requests. A database lock-contention test holds the higher source ID, proves the lower ID is already locked by the blocked HTTP request using `FOR UPDATE NOWAIT`, then releases the blocker and verifies successful completion. Existing transaction endpoint behavior remains unchanged.

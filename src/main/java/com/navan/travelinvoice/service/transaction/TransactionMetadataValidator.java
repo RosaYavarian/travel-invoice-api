@@ -1,6 +1,6 @@
 package com.navan.travelinvoice.service.transaction;
 
-import com.navan.travelinvoice.exception.InvalidTransactionException;
+import com.navan.travelinvoice.exception.transaction.InvalidTransactionException;
 import com.navan.travelinvoice.model.entity.transaction.TransactionType;
 import java.math.BigDecimal;
 import java.time.Instant;

@@ -1,8 +1,8 @@
 package com.navan.travelinvoice.service.transaction;
 
-import com.navan.travelinvoice.exception.DuplicateTransactionException;
-import com.navan.travelinvoice.exception.InvalidTransactionException;
-import com.navan.travelinvoice.exception.TransactionNotFoundException;
+import com.navan.travelinvoice.exception.transaction.DuplicateTransactionException;
+import com.navan.travelinvoice.exception.transaction.InvalidTransactionException;
+import com.navan.travelinvoice.exception.transaction.TransactionNotFoundException;
 import com.navan.travelinvoice.model.dto.transaction.CreateTransactionRequest;
 import com.navan.travelinvoice.model.dto.transaction.TransactionResponse;
 import com.navan.travelinvoice.model.entity.transaction.Transaction;
