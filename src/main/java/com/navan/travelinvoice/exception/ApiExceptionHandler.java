@@ -1,6 +1,7 @@
 package com.navan.travelinvoice.exception;
 
 import java.util.Map;
+import com.navan.travelinvoice.exception.transaction.TransactionConflictException;
 
 import com.navan.travelinvoice.exception.invoice.InvalidInvoiceException;
 import com.navan.travelinvoice.exception.invoice.InvoiceConflictException;
@@ -19,6 +20,11 @@ import org.springframework.web.method.annotation.MethodArgumentTypeMismatchExcep
 
 @RestControllerAdvice
 public class ApiExceptionHandler {
+    @ExceptionHandler(TransactionConflictException.class)
+    public ProblemDetail transactionConflict(TransactionConflictException exception) {
+        return ProblemDetail.forStatusAndDetail(HttpStatus.CONFLICT, exception.getMessage());
+    }
+
     @ExceptionHandler(InvoiceConflictException.class)
     public ProblemDetail invoiceConflict(InvoiceConflictException exception) {
         return ProblemDetail.forStatusAndDetail(HttpStatus.CONFLICT, exception.getMessage());

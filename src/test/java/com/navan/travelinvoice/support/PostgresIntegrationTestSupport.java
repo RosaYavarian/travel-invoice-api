@@ -120,6 +120,18 @@ public abstract class PostgresIntegrationTestSupport {
                 HttpResponse.BodyHandlers.ofString());
     }
 
+    protected HttpResponse<String> patch(long id, JsonNode input) throws Exception {
+        return client.send(HttpRequest.newBuilder(uri("/transactions/" + id))
+                .timeout(Duration.ofSeconds(20)).header("Content-Type", "application/json")
+                .method("PATCH", HttpRequest.BodyPublishers.ofString(mapper.writeValueAsString(input))).build(),
+                HttpResponse.BodyHandlers.ofString());
+    }
+
+    protected HttpResponse<String> delete(long id) throws Exception {
+        return client.send(HttpRequest.newBuilder(uri("/transactions/" + id))
+                .timeout(Duration.ofSeconds(20)).DELETE().build(), HttpResponse.BodyHandlers.ofString());
+    }
+
     protected JsonNode json(HttpResponse<String> response) {
         return mapper.readTree(response.body());
     }

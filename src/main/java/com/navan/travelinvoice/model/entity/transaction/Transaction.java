@@ -64,6 +64,30 @@ public class Transaction {
         this.metadata = metadata.deepCopy();
     }
 
+    public void updateTotal(BigDecimal total) {
+        this.total = total;
+    }
+
+    public void updateOccurredAt(Instant occurredAt) {
+        this.occurredAt = occurredAt;
+    }
+
+    public void replaceMetadata(JsonNode metadata) {
+        this.metadata = metadata.deepCopy();
+    }
+
+    public void replaceTaxLines(List<TransactionTax> replacements) {
+        taxLines.forEach(line -> line.setTransaction(null));
+        taxLines.clear();
+        replacements.forEach(this::addTaxLine);
+    }
+
+    public void replaceFeeLines(List<TransactionFee> replacements) {
+        feeLines.forEach(line -> line.setTransaction(null));
+        feeLines.clear();
+        replacements.forEach(this::addFeeLine);
+    }
+
     public Long getId() {
         return id;
     }
