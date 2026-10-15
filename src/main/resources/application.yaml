@@ -7,6 +7,10 @@ spring:
     username: ${DB_USER}
     password: ${DB_PASSWORD}
 
+  jackson:
+    deserialization:
+      use-big-decimal-for-floats: true
+
   jpa:
     open-in-view: false
     hibernate:
