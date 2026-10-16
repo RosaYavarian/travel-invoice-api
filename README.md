@@ -35,7 +35,7 @@ curl -i http://localhost:8080/invoices/1
 
 Invoice creation returns 201. Missing source transactions or invoices return 404. Mixed currencies and repeated transaction IDs return 409; invalid request shapes or an overflowing grand total return 400. Provide exactly one ID field. Snapshot lines are ordered by ascending source transaction ID. Taxes roll up by name/rate and fees by name; gross totals already include these charges. The five trip fixtures produce EUR 685.70.
 
-Invoice GET reads stored snapshots, so later source changes do not alter billed data. List endpoints are not implemented in this phase.
+Invoice GET reads stored snapshots, so later source changes do not alter billed data. Transaction and invoice list endpoints support bounded limit/offset pagination.
 
 
 ## Transaction PATCH and DELETE
@@ -64,3 +64,17 @@ curl -i -X DELETE http://localhost:8080/invoices/1
 Invoice PATCH replaces the complete transaction set and rebuilds every snapshot from current stored source data. It accepts the same body as invoice creation: provide exactly one of `transaction_id` or a nonempty `transaction_ids` list. The invoice ID and creation timestamp are preserved. Currency, grand total, snapshot lines, and tax/fee rollups are recalculated; replacing with an entirely different currency is allowed if all new sources agree. Successful PATCH returns 200. Missing invoice/source IDs return 404, mixed currencies or duplicate IDs return 409, and invalid request shapes return 400. Validation or database failures preserve the original invoice and all snapshot rows.
 
 Invoice DELETE returns 204 and removes the invoice and its snapshots, preserving all source transactions, taxes, and fees. A missing invoice returns 404. After deletion or replacement commits, a removed source becomes editable/deletable unless another invoice still references it. Concurrent invoice and transaction operations are serialized through database row locks; a transaction mutation may still return 409 if it observes invoice membership before removal commits. Invoice GET fetches the header and snapshots together in one database statement to avoid combining data from different committed invoice versions.
+
+
+## Paginated lists
+
+```sh
+curl -i 'http://localhost:8080/transactions?limit=50&offset=0'
+curl -i 'http://localhost:8080/invoices?limit=100&offset=100'
+```
+
+Both endpoints return `{"items":[...],"limit":50,"offset":0}`. Each item has the same complete fields as the corresponding single-resource GET, including transaction taxes/fees/metadata and invoice snapshots/rollups. Items are ordered by ascending ID. Defaults are limit 50 and offset 0; limits outside 1–100, negative offsets, non-integer values, and values outside the supported Java integer range return 400. Empty pages return 200 with an empty items array. No total count is included.
+
+Pagination runs in PostgreSQL before child data is loaded. A nonempty transaction page uses three SQL queries (IDs, parents/taxes, parents/fees); an invoice page uses two (IDs, parents/snapshots). Empty pages use one query. Counts include DTO mapping and remain constant for pages of 1, 50, or 100. There are no per-item lazy-load queries, and invoice lists never load live source transactions. Fetch results are mapped back into the exact order of the initial ID page.
+
+Each list operation uses its own read-only REPEATABLE_READ transaction for a consistent parent/child view. Separate page requests do not share a database snapshot: concurrent deletions can shift offsets and cause skipped/duplicated records across requests. Deep offsets require PostgreSQL to walk/discard earlier rows, so cursor pagination would be a future option for very large scans. Parent limits do not cap the number of child rows within each selected transaction or invoice.

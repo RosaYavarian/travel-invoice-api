@@ -6,6 +6,7 @@ import com.navan.travelinvoice.model.dto.transaction.TransactionResponse;
 import com.navan.travelinvoice.service.transaction.TransactionService;
 import jakarta.validation.Valid;
 import java.net.URI;
+import com.navan.travelinvoice.model.dto.common.PageResponse;
 
 import jakarta.validation.constraints.Positive;
 import org.springframework.http.ResponseEntity;
@@ -24,6 +25,12 @@ public class TransactionController {
     public ResponseEntity<TransactionResponse> create(@Valid @RequestBody CreateTransactionRequest request) {
         TransactionResponse response = service.create(request);
         return ResponseEntity.created(URI.create("/transactions/" + response.id())).body(response);
+    }
+
+    @GetMapping
+    public PageResponse<TransactionResponse> list(@RequestParam(defaultValue = "50") int limit,
+                                              @RequestParam(defaultValue = "0") int offset) {
+        return service.list(limit, offset);
     }
 
     @GetMapping("/{id}")

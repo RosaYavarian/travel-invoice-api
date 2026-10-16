@@ -10,6 +10,11 @@ import com.navan.travelinvoice.model.entity.transaction.TransactionFee;
 import com.navan.travelinvoice.model.entity.transaction.TransactionTax;
 import com.navan.travelinvoice.repository.transaction.TransactionRepository;
 import java.util.Currency;
+import java.util.List;
+import java.util.HashMap;
+import com.navan.travelinvoice.model.dto.common.PageResponse;
+import com.navan.travelinvoice.model.dto.common.Pagination;
+import org.springframework.transaction.TransactionDefinition;
 import com.navan.travelinvoice.exception.transaction.TransactionConflictException;
 import com.navan.travelinvoice.model.dto.transaction.PatchTransactionRequest;
 import com.navan.travelinvoice.repository.invoice.InvoiceLineSnapshotRepository;
@@ -30,6 +35,7 @@ public class TransactionService {
     private final TransactionMetadataValidator metadataValidator;
     private final TransactionTemplate writeTransaction;
     private final TransactionTemplate readTransaction;
+    private final TransactionTemplate listTransaction;
 
     public TransactionService(TransactionRepository repository,
                               TransactionMetadataValidator metadataValidator,
@@ -43,6 +49,9 @@ public class TransactionService {
         this.writeTransaction = new TransactionTemplate(transactionManager);
         this.readTransaction = new TransactionTemplate(transactionManager);
         this.readTransaction.setReadOnly(true);
+        this.listTransaction = new TransactionTemplate(transactionManager);
+        this.listTransaction.setReadOnly(true);
+        this.listTransaction.setIsolationLevel(TransactionDefinition.ISOLATION_REPEATABLE_READ);
     }
 
     public TransactionResponse create(CreateTransactionRequest request) {
@@ -69,6 +78,21 @@ public class TransactionService {
             }
             throw new DuplicateTransactionException(existingId);
         }
+    }
+
+    public PageResponse<TransactionResponse> list(int limit, int offset) {
+        Pagination.validate(limit, offset);
+        return listTransaction.execute(status -> {
+            List<Long> ids = repository.findPageIds(limit, offset);
+            if (ids.isEmpty()) return new PageResponse<>(List.of(), limit, offset);
+            var parents = new HashMap<Long, Transaction>();
+            repository.fetchWithTaxLines(ids).forEach(parent -> parents.put(parent.getId(), parent));
+            // The same persistence context initializes fees on the already loaded parents.
+            // Separate collection joins avoid both multiple-bag fetches and Cartesian products.
+            repository.fetchWithFeeLines(ids);
+            return new PageResponse<>(ids.stream().map(id -> TransactionResponse.from(parents.get(id))).toList(),
+                    limit, offset);
+        });
     }
 
     public TransactionResponse get(long id) {

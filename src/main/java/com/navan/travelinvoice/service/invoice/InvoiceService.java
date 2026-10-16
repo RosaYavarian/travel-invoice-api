@@ -16,6 +16,10 @@ import com.navan.travelinvoice.repository.invoice.InvoiceRepository;
 import com.navan.travelinvoice.repository.transaction.TransactionRepository;
 import java.math.BigDecimal;
 import java.util.ArrayList;
+import java.util.HashMap;
+import com.navan.travelinvoice.model.dto.common.PageResponse;
+import com.navan.travelinvoice.model.dto.common.Pagination;
+import org.springframework.transaction.annotation.Isolation;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
@@ -104,6 +108,17 @@ public class InvoiceService {
     }
 
     private record InvoiceContents(String currency, BigDecimal grandTotal, List<InvoiceLineSnapshot> lines) {
+    }
+
+    @Transactional(readOnly = true, isolation = Isolation.REPEATABLE_READ)
+    public PageResponse<InvoiceResponse> list(int limit, int offset) {
+        Pagination.validate(limit, offset);
+        List<Long> ids = invoices.findPageIds(limit, offset);
+        if (ids.isEmpty()) return new PageResponse<>(List.of(), limit, offset);
+        var parents = new HashMap<Long, Invoice>();
+        invoices.fetchWithLines(ids).forEach(parent -> parents.put(parent.getId(), parent));
+        // IN/fetch result ordering is deliberately ignored; the page ID query defines order.
+        return new PageResponse<>(ids.stream().map(id -> response(parents.get(id))).toList(), limit, offset);
     }
 
     @Transactional(readOnly = true)
