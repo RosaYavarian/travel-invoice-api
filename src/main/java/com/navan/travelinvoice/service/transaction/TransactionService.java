@@ -20,8 +20,6 @@ import com.navan.travelinvoice.model.dto.transaction.PatchTransactionRequest;
 import com.navan.travelinvoice.repository.invoice.InvoiceLineSnapshotRepository;
 import jakarta.validation.Validator;
 import tools.jackson.databind.json.JsonMapper;
-import org.hibernate.exception.ConstraintViolationException;
-import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
@@ -34,8 +32,8 @@ public class TransactionService {
     private final JsonMapper mapper;
     private final TransactionMetadataValidator metadataValidator;
     private final TransactionTemplate writeTransaction;
-    private final TransactionTemplate readTransaction;
     private final TransactionTemplate listTransaction;
+    private final TransactionTemplate singleReadTransaction;
 
     public TransactionService(TransactionRepository repository,
                               TransactionMetadataValidator metadataValidator,
@@ -47,8 +45,9 @@ public class TransactionService {
         this.mapper = mapper;
         this.metadataValidator = metadataValidator;
         this.writeTransaction = new TransactionTemplate(transactionManager);
-        this.readTransaction = new TransactionTemplate(transactionManager);
-        this.readTransaction.setReadOnly(true);
+        this.singleReadTransaction = new TransactionTemplate(transactionManager);
+        this.singleReadTransaction.setReadOnly(true);
+        this.singleReadTransaction.setIsolationLevel(TransactionDefinition.ISOLATION_REPEATABLE_READ);
         this.listTransaction = new TransactionTemplate(transactionManager);
         this.listTransaction.setReadOnly(true);
         this.listTransaction.setIsolationLevel(TransactionDefinition.ISOLATION_REPEATABLE_READ);
@@ -57,27 +56,21 @@ public class TransactionService {
     public TransactionResponse create(CreateTransactionRequest request) {
         validateBusinessFields(request);
 
-        try {
-            return writeTransaction.execute(status -> {
-                Transaction transaction = new Transaction(request.externalId(), request.type(),
-                        request.currency(), request.total(), request.occurredAt(), request.metadata());
-                request.taxLines().forEach(tax -> transaction.addTaxLine(
-                        new TransactionTax(tax.name(), tax.rate(), tax.amount())));
-                request.feeLines().forEach(fee -> transaction.addFeeLine(
-                        new TransactionFee(fee.name(), fee.amount())));
-                return TransactionResponse.from(repository.saveAndFlush(transaction));
-            });
-        } catch (DataIntegrityViolationException exception) {
-            if (!isExternalIdConflict(exception)) {
-                throw exception;
+        return writeTransaction.execute(status -> {
+            var identity = repository.insertOrIdentify(request.externalId(), request.type().getValue(),
+                    request.currency(), request.total(), request.occurredAt(), mapper.writeValueAsString(request.metadata()));
+            if (!identity.getInserted()) {
+                // Throw inside execute(): roll back the no-op conflict update before HTTP 409.
+                throw new DuplicateTransactionException(identity.getId());
             }
-            Long existingId = readTransaction.execute(status -> repository.findByExternalId(request.externalId())
-                    .map(Transaction::getId).orElse(null));
-            if (existingId == null) {
-                throw exception;
-            }
-            throw new DuplicateTransactionException(existingId);
-        }
+            Transaction transaction = repository.findById(identity.getId()).orElseThrow();
+            request.taxLines().forEach(tax -> transaction.addTaxLine(
+                    new TransactionTax(tax.name(), tax.rate(), tax.amount())));
+            request.feeLines().forEach(fee -> transaction.addFeeLine(
+                    new TransactionFee(fee.name(), fee.amount())));
+            repository.flush();
+            return TransactionResponse.from(transaction);
+        });
     }
 
     public PageResponse<TransactionResponse> list(int limit, int offset) {
@@ -96,7 +89,7 @@ public class TransactionService {
     }
 
     public TransactionResponse get(long id) {
-        return readTransaction.execute(status -> TransactionResponse.from(repository.findById(id)
+        return singleReadTransaction.execute(status -> TransactionResponse.from(repository.findById(id)
                 .orElseThrow(() -> new TransactionNotFoundException(id))));
     }
 
@@ -152,14 +145,4 @@ public class TransactionService {
         metadataValidator.validate(request.type(), request.metadata());
     }
 
-    private boolean isExternalIdConflict(Throwable exception) {
-        for (Throwable cause = exception; cause != null; cause = cause.getCause()) {
-            if (cause instanceof ConstraintViolationException violation
-                    && "23505".equals(violation.getSQLState())
-                    && "transactions_external_id_key".equals(violation.getConstraintName())) {
-                return true;
-            }
-        }
-        return false;
-    }
 }

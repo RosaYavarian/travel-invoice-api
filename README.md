@@ -1,80 +1,197 @@
 # Travel Invoice API
 
-Java 21 / Spring Boot / PostgreSQL 17. Implements transaction Create, GET, PATCH, and DELETE, plus invoice Create, GET, PATCH, and DELETE.
+## 1. Overview
 
-With Docker running, copy `.env.example` to `.env` once, then run:
+A backend service for structured travel transactions and invoice snapshots. Supports flight, hotel, rail, and Navan fee transactions (`trip_fee` and `agent_call_fee`), with separate taxes, fees, and type-specific metadata. Transactions and invoices support creation, retrieval, replacement/update, deletion, and paginated lists.
 
-```sh
+Invoices capture stored transaction data independently of later source changes. Explicit invoice PATCH rebuilds their snapshots; invoiced transactions cannot be modified or deleted.
+
+## 2. Tech Stack
+
+Java 21, Spring Boot 4.1.1, Spring Data JPA/Hibernate, PostgreSQL 17, Flyway, Gradle Kotlin DSL, Docker Compose, and PostgreSQL Testcontainers.
+
+## 3. Prerequisites
+
+- **Run the Docker stack:** Docker with Compose. The image builds the application; local Java and Gradle installations are unnecessary. Default host ports 8080 and 5432 must be available.
+- **Run tests locally:** Java 21 and a running Docker daemon. Use the included Gradle wrapper; no separate Gradle installation is needed.
+- **Run examples:** Bash, `curl` supporting `--fail-with-body`, and `jq`. Run commands from the repository root.
+
+## 4. Quick Start
+
+Create the local environment file once, preserving any existing settings:
+
+```bash
+if [ ! -f .env ]; then cp .env.example .env; fi
 docker compose up --build
 ```
 
-Run the integration tests with Java 21 and Docker available:
+Compose starts PostgreSQL and the API, applies Flyway migrations, and validates the schema. Wait for the application startup message. The default API URL is `http://localhost:8080`. In another Bash shell, verify it responds:
 
-```sh
+```bash
+BASE_URL="${BASE_URL:-http://localhost:8080}"
+curl --fail-with-body --silent --show-error "$BASE_URL/transactions?limit=1" | jq .
+```
+
+A fresh database returns an empty `items` array. PostgreSQL data persists in a Docker volume across restarts.
+
+## 5. Running Tests
+
+```bash
 ./gradlew test
 ```
 
-Tests start their own PostgreSQL 17 container and apply Flyway migrations. They do not require `.env` or the development database.
+Tests start their own PostgreSQL 17 Testcontainer, apply Flyway migrations, and exercise the HTTP API on random ports. Neither the development database nor `.env` is required. Tests cover fixtures, validation, financial rollups, snapshots, rollback, concurrent operations, and pagination/query counts. Test classes run sequentially; concurrency scenarios coordinate requests explicitly.
 
-Create a transaction using one of `flight`, `hotel`, `rail`, `trip_fee`, or `agent_call_fee` from the fixtures (examples use `jq`):
+## 6. API Endpoints
 
-```sh
-jq '.flight' fixtures/task-b/seed-payloads.json | curl -i -X POST http://localhost:8080/transactions -H 'Content-Type: application/json' --data-binary @-
-curl -i http://localhost:8080/transactions/1
+| Method | Path | Description |
+|---|---|---|
+| POST | `/transactions` | Create a transaction; reject duplicate external IDs |
+| GET | `/transactions/{id}` | Read a stored transaction |
+| GET | `/transactions` | List complete transactions with pagination |
+| PATCH | `/transactions/{id}` | Update supported fields if uninvoiced |
+| DELETE | `/transactions/{id}` | Delete an uninvoiced transaction and its children |
+| POST | `/invoices` | Snapshot one or more stored transactions |
+| GET | `/invoices/{id}` | Read invoice snapshots and rollups |
+| GET | `/invoices` | List complete invoices with pagination |
+| PATCH | `/invoices/{id}` | Replace the source set and rebuild snapshots |
+| DELETE | `/invoices/{id}` | Delete the invoice and snapshots, preserving sources |
+
+Successful POST returns **201**, GET/PATCH **200**, and DELETE **204**. Invalid input returns **400**, missing resources **404**, and duplicate external IDs, duplicate invoice source IDs, mixed currencies, or mutation of invoiced transactions **409**. Errors use HTTP Problem Detail responses; duplicate creation includes `existing_id`.
+
+## 7. Example Workflow
+
+Run the following blocks sequentially in one Bash shell against a fresh database. Fixture creation is intended to run once: existing `external_id` values cause 409. Continue using that shell for the mutation and pagination examples.
+
+Create all five transactions from [seed-payloads.json](fixtures/task-b/seed-payloads.json), capturing actual server-generated IDs:
+
+```bash
+BASE_URL="${BASE_URL:-http://localhost:8080}"
+create_fixture() {
+  jq --arg kind "$1" '.[$kind]' fixtures/task-b/seed-payloads.json |
+    curl --fail-with-body --silent --show-error "$BASE_URL/transactions" \
+      -H 'Content-Type: application/json' --data-binary @- |
+    jq -er '.id'
+}
+flight_id=$(create_fixture flight)
+hotel_id=$(create_fixture hotel)
+rail_id=$(create_fixture rail)
+trip_fee_id=$(create_fixture trip_fee)
+agent_call_fee_id=$(create_fixture agent_call_fee)
+curl --fail-with-body --silent --show-error "$BASE_URL/transactions/$flight_id" | jq .
 ```
 
-Successful creation returns 201 with the stored record and a Location header. Invalid input returns 400; missing records return 404. Repeating the valid POST returns 409 with `existing_id`, without modifying the original transaction. Money uses decimal values with up to two fractional digits. Taxes and fees are returned in ascending database-ID order.
+Each create returns 201. The GET returns stored metadata, taxes, and fees. Monetary amounts support up to two fractional digits; currency codes must be valid uppercase three-letter codes.
 
-Create an invoice from one transaction or a list of transaction IDs:
+Repeat the flight POST: expect **409** and `existing_id` equal to `$flight_id`:
 
-```sh
-curl -i -X POST http://localhost:8080/invoices -H 'Content-Type: application/json' -d '{"transaction_id":1}'
-curl -i -X POST http://localhost:8080/invoices -H 'Content-Type: application/json' -d '{"transaction_ids":[1,2,3,4,5]}'
-curl -i http://localhost:8080/invoices/1
+```bash
+jq '.flight' fixtures/task-b/seed-payloads.json |
+  curl --silent --show-error -w '\nHTTP %{http_code}\n' "$BASE_URL/transactions" \
+    -H 'Content-Type: application/json' --data-binary @-
+printf 'Expected existing_id: %s\n' "$flight_id"
 ```
 
-Invoice creation returns 201. Missing source transactions or invoices return 404. Mixed currencies and repeated transaction IDs return 409; invalid request shapes or an overflowing grand total return 400. Provide exactly one ID field. Snapshot lines are ordered by ascending source transaction ID. Taxes roll up by name/rate and fees by name; gross totals already include these charges. The five trip fixtures produce EUR 685.70.
+Prove that only one transaction was persisted using the Compose database:
 
-Invoice GET reads stored snapshots, so later source changes do not alter billed data. Transaction and invoice list endpoints support bounded limit/offset pagination.
-
-
-## Transaction PATCH and DELETE
-
-```sh
-curl -i -X PATCH http://localhost:8080/transactions/1 -H 'Content-Type: application/json' -d '{"total":225.50}'
-curl -i -X PATCH http://localhost:8080/transactions/1 -H 'Content-Type: application/json' -d '{"tax_lines":[],"fee_lines":[]}'
-curl -i -X DELETE http://localhost:8080/transactions/1
+```bash
+docker compose exec -T postgres sh -c 'exec psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"' <<'SQL'
+SELECT external_id, count(*) AS stored_rows
+FROM transactions
+WHERE external_id = 'flight-TXL-LHR-2026-03-11'
+GROUP BY external_id;
+SQL
 ```
 
-PATCH supports `total`, `occurred_at`, `tax_lines`, `fee_lines`, and `metadata`. Omitted fields keep their current values. Explicit top-level nulls return 400, including `{"metadata":null}`; optional nested tax rates may still be null. Supplied tax/fee arrays replace the entire list, and empty arrays clear it. Metadata is a complete replacement, not a merge: include every required field for the stored transaction type. Invalid replacement metadata rejects the entire PATCH, including any other supplied changes. Monetary precision and metadata validation match transaction creation.
+Expected `stored_rows`: **1**. Duplicate POST does not overwrite the existing transaction.
 
-`external_id`, `type`, `currency`, and all unsupported fields cannot be patched; supplying them returns 400 even if their values match. An empty object is a no-op for an uninvoiced transaction. Successful PATCH returns 200 with the updated transaction; successful DELETE returns 204 without a body. Missing transactions return 404. Both operations return 409 when the transaction belongs to any invoice (including an empty PATCH), leaving transactions, taxes, fees, and invoice snapshots unchanged. To observe the conflict, create an invoice for a transaction, then repeat the PATCH or DELETE curl for that ID.
+Create and retrieve the trip invoice using the returned IDs:
 
-Each operation locks the transaction before checking invoice membership. Header changes and tax/fee replacement or deletion commit atomically. Concurrent operations serialize on the same transaction; no partial child lists are exposed by a committed write.
-
-
-## Invoice PATCH and DELETE
-
-```sh
-curl -i -X PATCH http://localhost:8080/invoices/1 -H 'Content-Type: application/json' -d '{"transaction_ids":[2,3]}'
-curl -i -X PATCH http://localhost:8080/invoices/1 -H 'Content-Type: application/json' -d '{"transaction_id":2}'
-curl -i -X DELETE http://localhost:8080/invoices/1
+```bash
+invoice=$(jq -n --argjson flight "$flight_id" --argjson hotel "$hotel_id" \
+  --argjson rail "$rail_id" --argjson trip_fee "$trip_fee_id" \
+  --argjson agent_call_fee "$agent_call_fee_id" \
+  '{transaction_ids:[$flight,$hotel,$rail,$trip_fee,$agent_call_fee]}' |
+  curl --fail-with-body --silent --show-error "$BASE_URL/invoices" \
+    -H 'Content-Type: application/json' --data-binary @-)
+invoice_id=$(printf '%s' "$invoice" | jq -er '.id')
+printf '%s' "$invoice" | jq '{id,currency,grand_total,tax_rollup,fee_rollup}'
+curl --fail-with-body --silent --show-error "$BASE_URL/invoices/$invoice_id" | jq .
 ```
 
-Invoice PATCH replaces the complete transaction set and rebuilds every snapshot from current stored source data. It accepts the same body as invoice creation: provide exactly one of `transaction_id` or a nonempty `transaction_ids` list. The invoice ID and creation timestamp are preserved. Currency, grand total, snapshot lines, and tax/fee rollups are recalculated; replacing with an entirely different currency is allowed if all new sources agree. Successful PATCH returns 200. Missing invoice/source IDs return 404, mixed currencies or duplicate IDs return 409, and invalid request shapes return 400. Validation or database failures preserve the original invoice and all snapshot rows.
+Expected values match [expected-invoice.json](fixtures/task-b/expected-invoice.json):
 
-Invoice DELETE returns 204 and removes the invoice and its snapshots, preserving all source transactions, taxes, and fees. A missing invoice returns 404. After deletion or replacement commits, a removed source becomes editable/deletable unless another invoice still references it. Concurrent invoice and transaction operations are serialized through database row locks; a transaction mutation may still return 409 if it observes invoice membership before removal commits. Invoice GET fetches the header and snapshots together in one database statement to avoid combining data from different committed invoice versions.
+| Field | Expected value |
+|---|---|
+| Currency / grand total | EUR / **685.70** |
+| Tax rollup | Airport tax **15.00**; VAT at **0.07**, amount **21.70** |
+| Fee rollup | Booking fee **4.00**; YQ **25.00** |
 
+Grand total sums gross transaction totals once; taxes and fees are not added again. A single-source invoice can use `transaction_id` instead of `transaction_ids`. Supply exactly one field and a nonempty source set. Positive integer JSON IDs and integer strings are supported; fractional values (including `1.0`), invalid types, and out-of-range IDs return 400. Missing sources return 404; mixed currencies or repeated IDs return 409.
 
-## Paginated lists
+## 8. PATCH and DELETE Examples
 
-```sh
-curl -i 'http://localhost:8080/transactions?limit=50&offset=0'
-curl -i 'http://localhost:8080/invoices?limit=100&offset=100'
+### Transactions
+
+Use a separate uninvoiced transaction for successful mutations, then verify that the trip flight is protected:
+
+```bash
+# Create a separate uninvoiced record to demonstrate successful PATCH and DELETE.
+scratch_id=$(jq '.flight | .external_id += "-crud-example"' fixtures/task-b/seed-payloads.json |
+  curl --fail-with-body --silent --show-error "$BASE_URL/transactions" \
+    -H 'Content-Type: application/json' --data-binary @- | jq -er '.id')
+curl -i -X PATCH "$BASE_URL/transactions/$scratch_id" -H 'Content-Type: application/json' -d '{"total":225.50}'
+curl -i -X PATCH "$BASE_URL/transactions/$scratch_id" -H 'Content-Type: application/json' -d '{"tax_lines":[],"fee_lines":[]}'
+curl -i -X DELETE "$BASE_URL/transactions/$scratch_id"
+# The trip flight is invoiced: both commands below must return 409.
+curl -i -X PATCH "$BASE_URL/transactions/$flight_id" -H 'Content-Type: application/json' -d '{"total":225.50}'
+curl -i -X DELETE "$BASE_URL/transactions/$flight_id"
 ```
 
-Both endpoints return `{"items":[...],"limit":50,"offset":0}`. Each item has the same complete fields as the corresponding single-resource GET, including transaction taxes/fees/metadata and invoice snapshots/rollups. Items are ordered by ascending ID. Defaults are limit 50 and offset 0; limits outside 1–100, negative offsets, non-integer values, and values outside the supported Java integer range return 400. Empty pages return 200 with an empty items array. No total count is included.
+PATCH supports `total`, `occurred_at`, `tax_lines`, `fee_lines`, and `metadata`. Omitted fields retain their values; explicit top-level nulls return 400. Optional nested tax rates may be null. Tax/fee arrays and metadata are complete replacements, not merges; empty arrays clear collections. Replacement metadata must include all required fields for the stored type. Invalid input rejects the entire update.
 
-Pagination runs in PostgreSQL before child data is loaded. A nonempty transaction page uses three SQL queries (IDs, parents/taxes, parents/fees); an invoice page uses two (IDs, parents/snapshots). Empty pages use one query. Counts include DTO mapping and remain constant for pages of 1, 50, or 100. There are no per-item lazy-load queries, and invoice lists never load live source transactions. Fetch results are mapped back into the exact order of the initial ID page.
+`external_id`, `type`, `currency`, and unsupported fields cannot be patched. An empty PATCH is a no-op only for an uninvoiced transaction. If any invoice references the transaction, PATCH (including an empty object) and DELETE return 409 without changing stored data.
 
-Each list operation uses its own read-only REPEATABLE_READ transaction for a consistent parent/child view. Separate page requests do not share a database snapshot: concurrent deletions can shift offsets and cause skipped/duplicated records across requests. Deep offsets require PostgreSQL to walk/discard earlier rows, so cursor pagination would be a future option for very large scans. Parent limits do not cap the number of child rows within each selected transaction or invoice.
+### Invoices
+
+Replace the trip invoice with two sources, replace it again with one, then delete it:
+
+```bash
+jq -n --argjson flight "$flight_id" --argjson hotel "$hotel_id" \
+  '{transaction_ids:[$flight,$hotel]}' |
+  curl -i -X PATCH "$BASE_URL/invoices/$invoice_id" -H 'Content-Type: application/json' --data-binary @-
+jq -n --argjson flight "$flight_id" '{transaction_id:$flight}' |
+  curl -i -X PATCH "$BASE_URL/invoices/$invoice_id" -H 'Content-Type: application/json' --data-binary @-
+curl -i -X DELETE "$BASE_URL/invoices/$invoice_id"
+```
+
+PATCH uses the same request format as invoice creation. It atomically rebuilds all snapshots, currency, total, and rollups from current stored sources, preserving invoice ID and creation time. Failures leave the original invoice unchanged. All replacement sources must share a currency, which may differ from the previous invoice currency.
+
+DELETE removes only the invoice and snapshots. Removed sources become editable/deletable after commit unless another invoice still references them. Source transactions, taxes, and fees remain stored.
+
+## 9. Pagination
+
+```bash
+curl -i "$BASE_URL/transactions?limit=50&offset=0"
+curl -i "$BASE_URL/invoices?limit=100&offset=100"
+```
+
+Both endpoints accept `limit` (default **50**, range **1–100**) and `offset` (default **0**, nonnegative). Invalid bounds/types or values outside the Java integer range return 400.
+
+Responses have the form `{"items":[...],"limit":50,"offset":0}`. Items appear in ascending ID order and contain complete single-resource DTOs, including nested data and invoice rollups. Empty pages return 200 with `items: []`; no total count is included. The invoice example above may return an empty page after the workflow deletes its only invoice.
+
+See [Pagination & Performance](ARCHITECTURE.md#6-pagination--performance) for database-side pagination, N+1 prevention, read isolation, measured query counts, and OFFSET limitations.
+
+## 10. Database Indexes
+
+Flyway creates the schema and indexes; Hibernate validates them:
+
+- Primary keys on transaction/invoice IDs support resource lookup and ascending-ID pagination.
+- `transactions_external_id_key` enforces uniqueness under concurrent POSTs.
+- `idx_transaction_taxes_transaction_id` and `idx_transaction_fees_transaction_id` support child loading.
+- `uq_invoice_transaction` prevents repeated sources per invoice and supports snapshot lookup by its leading `invoice_id`.
+- `idx_snapshot_transaction` supports the invoice-membership check before transaction mutation.
+
+## 11. Architecture & Design Decisions
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for snapshot independence, atomic writes, row-lock ordering and race handling, PostgreSQL-specific duplicate resolution, and bounded fetching/performance trade-offs. The design uses the database for identity and concurrency control without additional infrastructure.

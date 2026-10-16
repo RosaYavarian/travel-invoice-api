@@ -1,137 +1,117 @@
-## Data Validation and Modeling Decisions
+# Architecture
 
-### Currency Validation
+## 1. System Overview
 
-Currency values are stored as three-character codes in PostgreSQL. The application validates currency codes before persistence using Java's Currency API. This keeps invalid currency values from entering through the HTTP API.
+The service stores structured travel transactions and builds invoices from persisted data. It uses Java 21, Spring Boot 4.1.1, Spring MVC, Jakarta Validation, Spring Data JPA/Hibernate, PostgreSQL 17, Flyway, and Gradle Kotlin DSL. It has no external booking or billing dependencies.
 
-### Tax and Fee Ordering
+```mermaid
+flowchart LR
+    Controllers[REST Controllers] --> Services[Services]
+    Services --> Repositories[Repositories]
+    Repositories --> DB[(PostgreSQL)]
+    Services -.-> DTOs[DTO mapping]
+    Flyway[Flyway migrations] --> DB
+```
 
-Transaction taxes and fees are stored in separate relational tables. Their original input order is not guaranteed by the current schema. The API returns them in a deterministic order based on their database IDs. Original array ordering is not part of the API contract.
+Packages separate responsibilities by layer and resource:
 
-### Type-Specific Metadata Validation
+- `controller`: HTTP routing, request validation, and response status codes.
+- `model/dto`: API contracts, presence-aware transaction PATCH input, and response mapping.
+- `service`: aggregate operations, financial calculations, transaction boundaries, and locking.
+- `repository`: persistence queries, bounded collection loading, and row locks.
+- `model/entity`: transaction aggregates and invoice snapshots.
+- `exception`: domain failures translated into HTTP Problem Detail responses.
 
-Transaction-specific metadata is stored as PostgreSQL JSONB to support different travel products without introducing separate tables for every transaction type.
+Controllers return DTOs rather than managed entities. Open Session in View is disabled; services materialize responses before their database transaction ends. This makes database access explicit and prevents serialization from unexpectedly loading relationships. README contains runnable API examples.
 
-The application validates metadata according to the transaction type before persistence. Required flight, hotel, rail, and Navan fee fields are checked, including supported Navan fee kinds. Invalid metadata results in HTTP 400.
+## 2. Data Model & Persistence
 
-This approach keeps the database schema simple while maintaining validation at the API boundary.
+Flyway owns the schema; Hibernate uses `ddl-auto=validate`, not runtime schema generation. PostgreSQL constraints complement application validation.
 
-### Transaction Create and GET
+`transactions` holds identity, type, currency, gross total, timestamps, and JSONB metadata. `Transaction` owns separate `transaction_taxes` and `transaction_fees` collections with cascading persistence and orphan removal. Their non-null foreign keys also specify `ON DELETE CASCADE`. Separating taxes from fees preserves their distinct business meaning and supports relational lookup without forcing every product detail into tables.
 
-`Transaction` is the aggregate root. Taxes and fees are separate child entities with non-null foreign keys, cascading persistence, and `@OrderBy("id ASC")`. DTOs define the HTTP contract; JPA entities are never returned by controllers. Headers and children are persisted in one database transaction. Reads map the aggregate to a DTO inside a read-only transaction because Open Session in View is disabled.
+JSONB accommodates flight coupons, hotel addresses, rail legs, and Navan fee details without separate product hierarchies. Hibernate uses the configured Jackson JSON mapper, including decimal-number handling. Additional metadata survives round trips; JSONB preserves values and array order, not textual object-key order or numeric formatting. Java enum constants are uppercase while JSON and stored type values remain lowercase. Timestamps use `Instant` and PostgreSQL `TIMESTAMPTZ`.
 
-Java enum constants are uppercase; JSON and database values remain `flight`, `hotel`, `rail`, and `navan_fee`. Metadata is a Jackson JSON tree mapped with Hibernate's Jackson 3 JSONB support. Decimal JSON numbers are parsed as BigDecimal, preserving precision and additional metadata fields. JSONB preserves values and array order, not textual object-key order or number formatting. Flight `coupons` must exist as an array but may be empty; every supplied coupon is validated. Rail `legs` must be nonempty.
+An `Invoice` owns ordered `invoice_line_snapshots`. Each line stores the source transaction ID, type, currency, total, metadata, taxes, and fees. The source ID is a scalar JPA field, with an existing database foreign key using `ON DELETE RESTRICT`. There is no entity association from a snapshot to the source transaction, preventing accidental live-data reads or cascading source deletion. Snapshot tax/fee structures are JSONB because they are frozen values rather than independently editable children. Snapshots capture transaction financial data and metadata at invoice creation; subsequent source changes do not modify them, and only explicit invoice PATCH rebuilds them.
 
-Money columns accept at most 17 integer digits and two fractional digits; tax rates accept up to six fractional digits and range from zero to one. Excess precision is rejected instead of rounded. Totals are already gross amounts, so taxes and fees are not added to them again. Currency validation uses `Currency.getInstance()` in addition to checking uppercase three-letter syntax.
+Primary keys support resource lookup and ascending-ID lists. Additional indexes enforce or support:
 
-### Duplicate Identity and Concurrent Creates
+- Unique `external_id`: authoritative transaction identity under concurrent creation.
+- Tax/fee `transaction_id` indexes: bounded aggregate loading.
+- Unique `(invoice_id, transaction_id)`: no repeated source within an invoice; its leading column also supports invoice-line loading.
+- Snapshot `transaction_id` index: efficient invoice-membership checks before transaction mutation.
 
-The existing unique constraint `transactions_external_id_key` is the source of truth. Valid duplicate POSTs return HTTP 409 with `existing_id`; they never replace stored fields or child records. Requests are validated before insertion, including duplicate requests.
+Check constraints restrict transaction types, uppercase currencies, tax-rate range, and JSON object/array shapes. Taxes, fees, and snapshot lines use database-ID ordering; original request array order is not guaranteed. Invoice creation adds sources in ascending transaction-ID order.
 
-The service uses a `TransactionTemplate` for the entire aggregate write. A unique-constraint violation escapes that transaction, which rolls back before conflict recovery begins. The service then opens a fresh read-only transaction to look up the existing ID. PostgreSQL's unique constraint serializes competing inserts for the same external ID; the loser reads the winner's committed record. Other database errors are not reported as duplicate conflicts.
+## 3. API Design & Validation
 
-### Integration Tests
+Transactions and invoices expose POST, single-resource GET, PATCH, DELETE, and paginated GET. Successful creation returns 201, reads and PATCH return 200, and DELETE returns 204. Invalid input returns 400; missing resources return 404. Duplicate external IDs, repeated invoice source IDs, mixed invoice currencies, and mutation of invoiced transactions return 409. Duplicate responses include `existing_id`.
 
-`./gradlew test` starts an isolated PostgreSQL 17 Testcontainer, applies the unchanged Flyway migrations, and starts the HTTP API on a random port with Hibernate schema validation enabled. Tests cover all five seed cases, decimal and metadata preservation, required/type-specific validation, deterministic child ordering, missing resources, sequential and concurrent duplicates, and atomic rollback after a forced child-insert failure. Docker must be running. Tests do not use the development database.
-## Transaction Management and Trade-offs
+Transaction creation requires the header, tax/fee arrays, and metadata. Type-specific validation checks flight origin/destination, fare, and every coupon; the coupons array must exist but may be empty. Hotels require name, address, stay dates, positive nights, and room rate; optional extras are validated. Rail requires nonempty legs with endpoints and timestamps. Navan fees support `trip_fee` and `agent_call_fee`. Extra metadata is retained rather than discarded by a closed product DTO.
 
-### Transaction Propagation
+Money uses `BigDecimal` and `NUMERIC(19,2)`: at most 17 integer digits and two fractional digits. API constraints reject excessive precision for totals and tax/fee amounts before persistence. Recognized metadata amounts use equivalent value-precision checks after stripping trailing zeros. Tax rates allow six fractional digits between zero and one. Database numeric columns alone would round excessive scale if direct SQL bypassed validation. Currency must be uppercase three-letter syntax and accepted by `Currency.getInstance()`.
 
-Transaction creation uses Spring's `TransactionTemplate` to manage database transactions explicitly.
+Transaction PATCH distinguishes presence from value. Omitted fields remain unchanged; explicit top-level nulls return 400. Supported fields are `total`, `occurred_at`, `tax_lines`, `fee_lines`, and `metadata`. Supplied lists replace their entire collections; empty arrays clear them. Metadata is a complete replacement validated against the stored type. Identity, type, currency, and unsupported fields cannot be patched. The merged proposed state is validated before any mutation; an empty PATCH is a no-op only for an uninvoiced transaction.
 
-When a duplicate `external_id` causes a PostgreSQL unique constraint violation, the write transaction is rolled back before a separate read transaction retrieves the existing transaction ID.
+Invoice POST and PATCH accept exactly one of `transaction_id` or a nonempty `transaction_ids` array. IDs must be positive signed 64-bit integers. Integer strings are supported; floating-point tokens, including `1.0`, are rejected rather than truncated. This deserialization rule is scoped to invoice ID fields.
 
-Both transaction templates currently use the default `PROPAGATION_REQUIRED` behavior.
+## 4. Transaction & Invoice Lifecycle
 
-**Trade-off:** This approach works correctly for the current HTTP endpoint because no outer transaction exists. However, if the service is called from another method with an active `@Transactional` context, the templates may join that transaction, breaking the assumption that rollback completes before duplicate recovery.
+Transaction creation persists the header, metadata, taxes, and fees atomically. Valid duplicate requests return 409 without committed changes to the existing aggregate; request validation still applies to duplicates.
 
-**Decision:** Keep the current implementation for the assignment. If transaction composition is introduced later, revisit the propagation strategy and transaction boundaries. `REQUIRES_NEW` is an option, but its independent commit behavior must be considered carefully.
+Invoice creation copies current stored sources into independent snapshots. Mutable metadata is deep-copied, tax/fee value records and lists are copied, and snapshot accessors return defensive copies. Invoice reads and rollups use persisted snapshots exclusively, so even direct source-data changes cannot alter an existing invoice response.
 
-### Database Constraint Name Dependency
+Snapshots remain frozen until explicit invoice PATCH replaces the complete source set. Replacement preserves invoice identity and creation time, validates and copies the requested sources, removes old lines, and rebuilds totals and snapshots. Old rows are explicitly flushed out before replacements are inserted, avoiding unique-constraint violations when source IDs overlap. Flush is not commit: deletion, insertion, and header updates share one transaction, so failure restores the original invoice and snapshot rows.
 
-Duplicate detection relies on PostgreSQL SQLSTATE `23505` (unique constraint violation) and the constraint name `transactions_external_id_key`.
+Invoice DELETE removes its header and snapshots without deleting sources. A removed source becomes editable/deletable after commit only if no other invoice references it. There are no invoice lifecycle statuses.
 
-Checking both ensures that unrelated database integrity errors are not incorrectly treated as duplicate transactions.
+Grand total sums source gross totals once with `BigDecimal`; taxes and fees are not added again. Overflow beyond the invoice column range is rejected before persistence. Tax rollups group exact, case-sensitive names and numerically equivalent rates, keeping absent rates distinct from zero. Fee rollups group exact names. Output sorts by name, then tax rate with absent rates first. The five supplied fixtures produce EUR 685.70.
 
-**Trade-off:** The implementation depends on the database constraint name. Renaming the constraint in a future Flyway migration without updating the application would break duplicate conflict detection.
+## 5. Concurrency & Data Consistency
 
-**Decision:** Keep the current implementation because the constraint is explicitly controlled by the project's database schema. Any future migration that renames it must update the corresponding application logic and tests.
+Writes use database transactions: transaction operations use `TransactionTemplate`; invoice operations use Spring `@Transactional`. Default REQUIRED propagation means future service composition must account for participation in an outer transaction and rollback-only behavior.
 
-### Concurrency Verification
+All cooperating mutations follow this locking protocol, holding `PESSIMISTIC_WRITE` locks until commit or rollback:
 
-Concurrent duplicate creation is verified through HTTP integration tests against PostgreSQL 17 using Testcontainers.
+1. Invoice PATCH/DELETE locks the existing invoice header first.
+2. Invoice PATCH locks the union of old and new source IDs in ascending order; DELETE locks its existing sources in that order. Creation locks requested sources in ascending order without an existing invoice lock.
+3. Transaction PATCH/DELETE locks the source header before checking invoice membership or touching children. These operations do not acquire invoice-header locks.
 
-The tests confirm that two overlapping requests with the same `external_id` result in:
+Source locks are acquired individually before loading source children. A future operation involving multiple existing invoices must lock those invoice headers in ascending order before source rows. Direct database writers must follow the same parent-lock protocol to participate in these guarantees.
 
-- One successful creation (`201 Created`).
-- One duplicate response (`409 Conflict`) containing the existing transaction ID.
-- Exactly one stored transaction.
-- No duplicate tax or fee records.
-- No modification of the original transaction data.
+This serializes snapshot creation against source mutation. If attachment commits first, transaction mutation returns 409. If mutation wins, an invoice copies the complete updated aggregate or returns 404 after deletion. Removal races may return 409 before removal commits or permit mutation afterward. Snapshot foreign-key checks also take locks; referenced rows are already locked by the invoice operation. Consistent ordering reduces deadlock risk, but is not a universal guarantee against external writers or other lock patterns.
 
-At the time of verification, 50 concurrent race-test executions passed without failures. This provides evidence of correctness under the tested conditions but does not guarantee that every possible concurrency schedule has been exercised.
+Transaction GET uses a dedicated read-only REPEATABLE_READ transaction so its separate header and child queries share one MVCC snapshot. Both list methods use their own read-only REPEATABLE_READ boundaries. Invoice GET fetches header and snapshots in one SQL statement. These read strategies leave write isolation and locking unchanged.
 
-### Invoice Create and GET
+Duplicate identity resolution uses PostgreSQL `INSERT ... ON CONFLICT (external_id) DO UPDATE ... RETURNING`. The conflict branch assigns the existing external ID to itself, captures the row ID under lock, and throws the duplicate exception inside the write transaction. Rollback completes before HTTP 409; no no-op update is committed. Children are inserted only for a new row. This avoids a post-rollback recovery SELECT racing with DELETE: deletion winning first permits a new 201, while conflict resolution winning first captures the existing ID for 409.
 
-An invoice owns ordered snapshot lines in `invoice_line_snapshots`. Each line copies source transaction ID, type, currency, gross total, metadata, tax lines, and fee lines. The source ID is a scalar JPA field; PostgreSQL retains its existing foreign key, but invoice reads have no entity relationship to current transactions. Metadata is recursively deep-copied, tax/fee lists and their immutable value records are copied, and metadata getters return defensive copies. The existing Hibernate JSON configuration handles all snapshot JSONB fields with decimal precision preserved.
+The returned `xmax = 0` distinguishes insertion from the conflict-update branch. This is an intentional PostgreSQL-specific system-column dependency, tested against PostgreSQL 17, rather than a portable JPA contract.
 
-Create accepts exactly one of `transaction_id` or `transaction_ids`. Empty/null/nonpositive IDs and invalid request shapes return 400; repeated IDs return 409. All sources must exist (404) and share one currency (409). Validation, source loading, snapshot copying, and invoice/header persistence happen within one database transaction. Any failure rolls back the header and every snapshot line. An aggregate outside NUMERIC(19,2) bounds is rejected with 400 before persistence.
+## 6. Pagination & Performance
 
-Grand total sums source gross totals once, using BigDecimal; tax and fee amounts are not added again. Tax rollups group exact, case-sensitive names and numerically equivalent rates (trailing zeros ignored), keeping an absent rate distinct from zero. Fee rollups group exact names. Rollups sort alphabetically by name, then rate with absent rate first. They are derived exclusively from persisted snapshot values, including on GET. Snapshot lines sort by database line ID; creation inserts them in ascending source ID order. No live transaction joins or new lifecycle statuses are used.
+Lists return `items`, `limit`, and `offset`, with complete single-resource DTOs and no total-count query. Defaults are 50 and 0; limits outside 1–100 or invalid/negative offsets return 400. Empty pages return 200.
 
-### Lock Ordering for Invoice and Future Mutation Operations
+A native parent-ID query applies PostgreSQL `ORDER BY id ASC LIMIT/OFFSET` before collection loading. Transactions then fetch parents/taxes and parents/fees in separate bounded queries within one persistence context. This avoids a taxes-times-fees Cartesian product and multiple-bag fetching. Invoices use one bounded parent/snapshot query, never current source transactions. Collection fetch queries have no pagination.
 
-Invoice creation sorts unique source IDs and acquires `PESSIMISTIC_WRITE` locks individually in ascending order through `TransactionRepository.findByIdForUpdate`. All header locks are acquired before loading tax/fee collections, and remain held until invoice commit or rollback. One query per source makes lock acquisition order explicit; it favors simplicity over bulk-query throughput.
+Results are deduplicated by parent ID, then mapped in the exact order of the original ID page. DTO conversion occurs after collections are initialized. Hibernate statement-count tests cover full HTTP mapping:
 
-Transaction PATCH/DELETE acquires the same parent transaction lock before checking invoice membership and before changing the header or any tax/fee children. An invoiced transaction rejects those operations with 409. Direct SQL writes to children that bypass this parent-lock protocol are outside that coordination contract.
+| Returned parents | Transactions | Invoices |
+|---|---:|---:|
+| 1, 50, or 100 | 3 queries | 2 queries |
+| Empty page | 1 query | 1 query |
 
-Invoice PATCH first locks the invoice header, then locks the union of existing and replacement transaction IDs in ascending order, and atomically rebuilds its snapshots. Invoice DELETE also locks its source rows, following the same invoice-first, ascending-source order. Never acquire an existing invoice lock after holding source transaction locks. If a future operation locks multiple invoices, acquire those invoice locks in ascending ID order first. Invoice create has no pre-existing invoice to lock. This common ordering prevents lock cycles among compliant application operations; long-held locks and unrelated SQL can still cause waits or database timeouts.
+High volume: hot source/invoice locks serialize conflicting writes, duplicate POSTs contend on the unique index, and large/deep lists consume database I/O and connections. Indexes, bounded parent pages, and fixed-query fetching address these costs without additional infrastructure. Parent limits do not bound child counts or JSON size; fetch joins repeat header data per child. Separate page requests do not share snapshots, so concurrent changes can shift OFFSET boundaries.
 
-### Invoice Verification
+## 7. Testing Strategy
 
-Sequential PostgreSQL 17 Testcontainers HTTP tests verify single/trip invoices (EUR 685.70), rollup grouping and decimal sums, error statuses and empty rollback results, full source header/metadata/tax/fee mutation independence, a forced failure after an earlier snapshot line was inserted, and reversed-order concurrent invoice requests. A database lock-contention test holds the higher source ID, proves the lower ID is already locked by the blocked HTTP request using `FOR UPDATE NOWAIT`, then releases the blocker and verifies successful completion. Existing transaction endpoint behavior remains unchanged.
+With Java 21 and Docker available, run `./gradlew test`. Tests start PostgreSQL 17 Testcontainers, apply Flyway migrations, enable Hibernate schema validation, and exercise HTTP endpoints on random ports. They do not require the development database or `.env`. Tests run sequentially because database cleanup is shared; concurrency scenarios explicitly coordinate overlapping requests.
 
+Coverage includes all five fixtures, EUR 685.70 totals and rollups, metadata round trips, validation, duplicate identity, CRUD conflicts, and snapshot independence after direct source header/metadata/tax/fee changes. Forced database failures verify aggregate and snapshot-replacement rollback. Controlled concurrent tests cover duplicate/create/delete races, transaction and invoice PATCH/DELETE, attachment/removal races, foreign-key interactions, and consistent reads. Pagination tests inspect SQL, statement counts, parent/child loads, ordering, and complete nested data. Tested schedules provide evidence, not proof of every possible interleaving.
 
-### Transaction PATCH Semantics and Atomic Mutation
+## 8. Trade-offs & Future Improvements
 
-PATCH uses a dedicated presence-aware DTO backed by a copied JSON object. An omitted key and an explicitly null key are distinct: omission preserves the current value, while explicit null is rejected with 400. A whitelist rejects identity changes (`external_id`, `type`, `currency`) and unsupported fields. Metadata and tax/fee arrays are complete replacements, not recursive merges. Empty arrays clear children, while an empty PATCH is a no-op only for an uninvoiced transaction.
+PostgreSQL JSONB, native pagination, row locks, and conflict resolution favor explicit behavior on the assignment stack over database portability. The `xmax` dependency deserves revalidation on database upgrades. Individual source locks and child loading keep invoice writes understandable but add queries as invoice size grows.
 
-After acquiring the existing `PESSIMISTIC_WRITE` parent lock, the service checks invoice membership using an indexed `existsByTransactionId` query. Missing rows yield 404, and any billed transaction yields 409. It then merges supplied top-level fields with the locked current state and validates the complete proposed state using the existing create DTO constraints, Java Currency validation, and type-specific metadata validator. No entity mutation happens until validation completes. Mutable JSON is deep-copied when applied. Only supplied collections are replaced, preserving omitted child identities; managed collections use orphan removal and correct parent references.
+There is no configured lock/statement timeout or deadlock retry policy. Short transactions limit normal contention, but a stalled holder can cause prolonged waits. Production hardening should choose bounded waits and API error semantics together rather than add broad retries.
 
-PATCH and DELETE each use one write TransactionTemplate, retaining the parent lock through commit or rollback. DELETE removes the aggregate and its children atomically. No invoice header locks are acquired by these operations. Transaction create's existing duplicate-recovery boundaries are unchanged.
-
-Concurrent PATCH/PATCH requests read current values after acquiring the lock, so disjoint supplied fields survive both requests; overlapping changes use the last committed write. PATCH/DELETE yields either PATCH 200 followed by DELETE 204 or DELETE 204 followed by PATCH 404. If invoice creation commits first, later transaction mutation returns 409. If PATCH wins, the invoice snapshots the complete updated aggregate; if DELETE wins, invoice creation returns 404 without partial invoice records. Snapshot rows are never rewritten by transaction mutation.
-
-HTTP integration tests run sequentially against PostgreSQL 17 Testcontainers. They separately verify omission and explicit null, full metadata replacement and invalid partial metadata, field/list validation, no-op and clear-list behavior, invoice conflicts, successful deletion, and rollback after forced fee-insert or header-delete failure. Concurrent mutation tests repeat races and use test-only triggers/advisory gates to force both invoice-first and mutation-first schedules while confirming row-lock waits through PostgreSQL. These gates are confined to test databases; production uses only the existing row-level locking protocol. Raw SQL writers must follow that protocol too. Long-running transactions may still cause lock waits/timeouts; this phase adds no lock timeout policy or retry mechanism.
-
-
-### Invoice Replacement and Deletion
-
-PATCH reuses the create request format and snapshot-copy/validation logic. It locks the invoice header with PESSIMISTIC_WRITE, then locks the union of old and requested source IDs individually in ascending order. The replacement data is validated and deep-copied before any existing state changes. Removing all old lines from the managed collection schedules orphan deletion; an explicit repository flush physically deletes those rows before any new line is attached or persisted. This prevents Hibernate identity-generation insert ordering from violating the existing `(invoice_id, transaction_id)` unique constraint for overlapping sets. A PostgreSQL BEFORE INSERT test trigger checks that every original snapshot ID is absent at replacement-insert time.
-
-After the deletion flush, currency and grand total are updated and fresh snapshots are inserted, all inside the same @Transactional service call. Flush is not commit: forced snapshot insert, header update, and invoice delete failures are tested to restore the exact original header and snapshot rows, including their IDs. Database sequences may still consume IDs on failed operations, as normal for PostgreSQL. Rollups are recalculated from the new frozen values using BigDecimal, with no extra addition of taxes/fees to gross totals. Invoice identity/creation timestamp remain unchanged. Reads use a fetch graph to retrieve the invoice and all lines in one SQL statement, avoiding an old header/new lines combination if replacement commits during GET.
-
-DELETE locks the invoice first, then all currently referenced source transactions in ascending order, before deleting snapshot children and the invoice. Scalar snapshot transaction IDs mean there is no JPA cascade from snapshots to source transactions; the existing foreign keys remain unchanged. Both operations hold locks until commit/rollback. Only committed snapshot membership determines whether transaction PATCH/DELETE is allowed; another invoice can keep a source protected after one reference is removed.
-
-### Foreign Key Locks and Concurrent Invoice Operations
-
-Explicit lock ordering is necessary but is not treated as a complete proof against every PostgreSQL deadlock. Snapshot inserts also perform foreign-key checks against both source transactions and their invoice. For these operations, the referenced rows have already been locked by the same database transaction before snapshot insertion. Snapshot deletions and cascades are issued only after all source locks are acquired. Invoice operations never reach back to acquire another existing invoice lock while holding sources. Transaction mutation locks sources only and performs a non-locking membership existence query, so it does not wait for an invoice row while blocking that invoice's source acquisition.
-
-Controlled PostgreSQL HTTP tests queue both invoice-first and transaction-first operations behind real source locks. Invoice replacement/deletion versus source mutation accepts outcomes according to the observed serialization: source mutation may reject old membership with 409, or succeed after removal commits. Adding a source races with mutation too: an earlier delete yields invoice 404 and unchanged old snapshots; earlier attachment yields source 409. Source PATCH either precedes snapshot creation completely or is rejected after attachment. Additional tests pause invoice DELETE during snapshot deletion and verify that waiting source mutations resume only after removal commits. Repeated same-invoice PATCH/PATCH and PATCH/DELETE, different-invoice source swaps, and invoice create versus delete exercise row locks, uniqueness, FK checks, and cascades together. No deadlock retry policy or new database objects are introduced in production; external writers and long lock holds remain operational risks.
-
-
-### High volume: Pagination and Fetching
-
-GET /transactions and GET /invoices accept integer limit (default 50, range 1–100) and offset (default 0, nonnegative). Both return `items`, `limit`, and `offset`, without an expensive total-count query. Invalid bounds/types return 400; empty pages return 200. The first native query selects only parent IDs ordered ascending with PostgreSQL LIMIT/OFFSET, using the existing primary-key index. Arbitrary offsets are supported directly, without rounding to page numbers or application-side slicing.
-
-For a nonempty transaction page, two additional JPQL queries LEFT JOIN FETCH taxes and fees separately for only those parent IDs. Both use the same persistence context, so the second query initializes fees on the same parents whose taxes were loaded by the first. This avoids multiple-bag fetch errors and the taxes-times-fees Cartesian product. There is no LIMIT/OFFSET on either collection query. A map deduplicates fetch results, and DTOs are constructed by iterating the initial ID list rather than relying on IN-clause or join ordering. Existing @OrderBy annotations govern children. TransactionResponse.from() runs only after both collections are initialized.
-
-For a nonempty invoice page, one additional query fetches the selected invoices and their snapshot lines. The same ID-to-parent mapping preserves exact initial order and one DTO per selected parent. Existing invoice response mapping recalculates rollups exclusively from persisted snapshots. Scalar snapshot source IDs prevent loading current transaction entities. Existing child indexes support bounded lookups: transaction tax/fee foreign-key indexes, and the leading invoice_id of the unique invoice snapshot index. Flyway migrations and JSONB mappings remain unchanged.
-
-The entire list operation, including mapping, runs inside a read-only REPEATABLE_READ transaction so ID selection and subsequent collection reads see one coherent MVCC snapshot. This isolation is scoped only to pagination: InvoiceService.list uses its own annotation and TransactionService.list a dedicated TransactionTemplate. Existing read/write templates, single-resource reads, and mutation locks/isolation are unchanged. List reads acquire no pessimistic row locks. Long-lived MVCC snapshots can delay cleanup of old row versions, so list transactions remain short.
-
-Expected prepared-statement counts through full HTTP response mapping are 3 for transactions and 2 for invoices, independent of nonempty page size (tested at 1, 50, and 100), and 1 for an empty page. Test-only Hibernate statistics and StatementInspector capture verify query counts, exact parent/child load counts, SQL LIMIT/OFFSET on the ID query, and absence of limits on fetch joins. Multiple tax/fee rows per source and two snapshots per invoice exercise completeness, deduplication, and absence of Cartesian multiplication. Tests fail if Hibernate attempts pagination over a collection fetch. Coordinated concurrent SQL writes between ID selection and child loading verify the repeatable-read consistency boundary for both endpoints.
-
-OFFSET pagination gets more expensive for deep offsets because earlier index entries must still be traversed. Separate HTTP requests see separate snapshots, so concurrent deletions/inserts can shift page boundaries; ascending order guarantees stable coverage only when the underlying set is stable. A future cursor API could improve deep scans. Each page is bounded by parent count, not nested payload size; fetch joins also repeat header/JSON data for each child row. These trade-offs favor a small, explicit fixed-query implementation over global batching or broader projection infrastructure.
-
-Under concurrent load, hot transaction/invoice row locks serialize conflicting writes, duplicate POSTs contend on the external_id unique index, and large/deep list reads consume database I/O and connections. Existing constraints prevent duplicate identities, mutation locks preserve financial aggregates, and bounded page sizes plus fixed-query collection loading avoid unbounded parent loads and N+1 amplification. No new infrastructure or configurable filtering/sorting is introduced.
+For sustained volume, consider cursor pagination, payload/source-count limits, and targeted CREATE query optimization. Another future optimization would acquire source row locks in deterministic ascending ID order, then batch-load related data for those locked sources; this is not currently implemented. Current CREATE performs three SELECTs: managed-header hydration and tax/fee initialization during response mapping. Longer REPEATABLE_READ operations also retain old row versions. These are explicit scaling limits; caches, messaging, and distributed locks are unnecessary for the present scope.
